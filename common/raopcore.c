@@ -171,10 +171,19 @@ struct raop_ctx_s *raop_create(struct in_addr host, struct mdnsd *svr, char *nam
 
 /*----------------------------------------------------------------------------*/
 void raop_delete(struct raop_ctx_s *ctx) {
+	int sock;
+	struct sockaddr addr;
+	socklen_t nlen = sizeof(struct sockaddr);
 
 	if (!ctx) return;
 
 	ctx->running = false;
+
+	// wake-up thread by connecting socket, needed for freeBSD
+	sock = socket(AF_INET, SOCK_STREAM, 0);
+	getsockname(ctx->sock, (struct sockaddr *) &addr, &nlen);
+	connect(sock, (struct sockaddr*) &addr, sizeof(addr));
+	closesocket(sock);
 
 	pthread_join(ctx->thread, NULL);
 
@@ -291,16 +300,8 @@ static void *rtsp_thread(void *arg) {
 			struct sockaddr_in peer;
 			socklen_t addrlen = sizeof(struct sockaddr_in);
 
-			FD_ZERO(&rfds);
-			FD_SET(ctx->sock, &rfds);
-
-			// freeBSD does not exit from accept() even when shutdown is made
-			n = select(ctx->sock + 1, &rfds, NULL, NULL, &timeout);
-
-			if (n > 0) {
-				sock = accept(ctx->sock, (struct sockaddr*) &peer, &addrlen);
-				ctx->peer.s_addr = peer.sin_addr.s_addr;
-			}
+			sock = accept(ctx->sock, (struct sockaddr*) &peer, &addrlen);
+			ctx->peer.s_addr = peer.sin_addr.s_addr;
 
 			if (sock != -1 && ctx->running) {
 				LOG_INFO("got RTSP connection %u", sock);
@@ -430,7 +431,7 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		if ((p = stristr(buf, "timing_port")) != NULL) sscanf(p, "%*[^=]=%hu", &tport);
 		if ((p = stristr(buf, "control_port")) != NULL) sscanf(p, "%*[^=]=%hu", &cport);
 
-		ht = hairtunes_init(ctx->peer, ctx->encode, false, ctx->drift, ctx->latencies,
+		ht = hairtunes_init(ctx->peer, ctx->encode, false, ctx->drift, true, ctx->latencies,
 							ctx->rtsp.aeskey, ctx->rtsp.aesiv, ctx->rtsp.fmtp,
 							cport, tport, ctx, hairtunes_cb);
 
@@ -453,6 +454,9 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		}
 
 	} else if (!strcmp(method, "RECORD")) {
+		unsigned short seqno = 0;
+		unsigned rtptime = 0;
+		char *p;
 
 		if (atoi(ctx->latencies)) {
 			char latency[6];
@@ -460,17 +464,25 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 			kd_add(resp, "Audio-Latency", latency);
 		}
 
+		buf = kd_lookup(headers, "RTP-Info");
+		if ((p = stristr(buf, "seq")) != NULL) sscanf(p, "%*[^=]=%hu", &seqno);
+		if ((p = stristr(buf, "rtptime")) != NULL) sscanf(p, "%*[^=]=%u", &rtptime);
+
+		if (ctx->ht) hairtunes_record(ctx->ht, seqno, rtptime);
+
 		ctx->callback(ctx->owner, RAOP_STREAM, &ctx->hport);
 
 	}  else if (!strcmp(method, "FLUSH")) {
 		unsigned short seqno = 0;
+		unsigned rtptime = 0;
 		char *p;
 
 		buf = kd_lookup(headers, "RTP-Info");
 		if ((p = stristr(buf, "seq")) != NULL) sscanf(p, "%*[^=]=%hu", &seqno);
+		if ((p = stristr(buf, "rtptime")) != NULL) sscanf(p, "%*[^=]=%u", &rtptime);
 
 		// only send FLUSH if useful (discards frames above buffer head and top)
-		if (ctx->ht && hairtunes_flush(ctx->ht, seqno, 0))
+		if (ctx->ht && hairtunes_flush(ctx->ht, seqno, rtptime))
 			ctx->callback(ctx->owner, RAOP_FLUSH, &ctx->hport);
 
 	}  else if (!strcmp(method, "TEARDOWN")) {

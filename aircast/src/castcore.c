@@ -40,9 +40,7 @@ static void *CastPingThread(void *args);
 extern log_level cast_loglevel;
 static log_level *loglevel = &cast_loglevel;
 
-
 #define DEFAULT_RECEIVER	"CC1AD845"
-
 
 /*----------------------------------------------------------------------------*/
 #if OSX
@@ -126,7 +124,6 @@ void InitSSL(void)
 
 	glSSLctx = SSL_CTX_new(method);
 	SSL_CTX_set_options(glSSLctx, SSL_OP_NO_SSLv2);
-
 }
 
 
@@ -380,6 +377,9 @@ bool CastConnect(struct sCastCtx *Ctx)
 	SendCastMessage(Ctx, CAST_CONNECTION, NULL, "{\"type\":\"CONNECT\"}");
 	pthread_mutex_unlock(&Ctx->Mutex);
 
+	// wake up everybody who can be waiting
+	WakeAll();
+
 	return true;
 }
 
@@ -489,13 +489,26 @@ void DeleteCastDevice(struct sCastCtx *Ctx)
 {
 	pthread_mutex_lock(&Ctx->Mutex);
 	Ctx->running = false;
-	CastDisconnect(Ctx);
 	pthread_mutex_unlock(&Ctx->Mutex);
+
+	CastDisconnect(Ctx);
+
+	// wake up cast communication & ping threads
+	WakeAll();
+
 	pthread_join(Ctx->PingThread, NULL);
 	pthread_join(Ctx->Thread, NULL);
+
+	// wake-up threads locked on GetTimedEvent
+	pthread_mutex_lock(&Ctx->eventMutex);
+	pthread_cond_signal(&Ctx->eventCond);
+	pthread_mutex_unlock(&Ctx->eventMutex);
+
+	// cleanup mutexes & conds
 	pthread_cond_destroy(&Ctx->eventCond);
 	pthread_mutex_destroy(&Ctx->eventMutex);
 	pthread_mutex_destroy(&Ctx->sslMutex);
+
 	LOG_INFO("[%p]: Cast device stopped", Ctx->owner);
 	SSL_free(Ctx->ssl);
 	free(Ctx);
@@ -613,7 +626,7 @@ void ProcessQueue(tCastCtx *Ctx) {
 		// version 1.24
 		if (Ctx->stopReceiver) {
 			SendCastMessage(Ctx, CAST_RECEIVER, NULL,
-						"{\"type\":\"STOP\",\"requestId\":%d,\"sessionId\":%s}", Ctx->waitId, Ctx->sessionId);
+						"{\"type\":\"STOP\",\"requestId\":%d}", Ctx->waitId);
 			Ctx->Status = CAST_CONNECTED;
 
 		}
@@ -660,7 +673,7 @@ static void *CastPingThread(void *args)
 			last = now;
 		}
 
-		usleep(50000);
+		WakeableSleep(1500);
 	}
 
 	// clear SSL error allocated memorry
@@ -687,7 +700,7 @@ static void *CastSocketThread(void *args)
 
 		// allow "virtual" power off
 		if (Ctx->Status == CAST_DISCONNECTED) {
-			usleep(100000);
+			WakeableSleep(0);
 			continue;
 		}
 
@@ -728,7 +741,7 @@ static void *CastSocketThread(void *args)
 				if (Ctx->stopReceiver) {
 					json_decref(root);
 					forward = false;
-                }
+				}
 			}
 
 			// respond to device ping
